@@ -1,0 +1,20 @@
+{
+  "models": [
+    { "model": "llama.cpp/Qwen3.8-27B-UD-IQ4_XS", "thinking": "low" },
+    { "model": "github-copilot/claude-sonnet-5", "thinking": "low" },
+    { "model": "opencode/gpt-5.4-mini", "thinking": "low" }
+  ],
+  "thinking": "low",
+  "maxIterations": 0,
+  "maxConsecutiveFailures": 3,
+  "maxNoOps": 3,
+  "maxWallTimeMs": 0,
+  "agentTimeoutMs": 1800000,
+  "failover": {
+    "cooldownMs": 300000,
+    "backoffBaseMs": 5000,
+    "backoffMaxMs": 900000,
+    "rateLimitMaxWaitMs": 3600000
+  },
+  "piBin": "pi"
+}

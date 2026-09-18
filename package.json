@@ -1,0 +1,17 @@
+{
+  "name": "foreveragent",
+  "version": "0.1.0",
+  "description": "Minimal autonomous agent loop: run pi until the objective is met, commit progress each iteration, roll back failures, fail over to the next model on model errors.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "foreveragent": "./bin/foreveragent.mjs"
+  },
+  "scripts": {
+    "test": "node --test --test-timeout=180000 test/*.test.mjs",
+    "foreveragent": "node bin/foreveragent.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
