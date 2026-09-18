@@ -53,6 +53,8 @@ export async function runForeverAgent(repo, argv, { scenario = null, timeoutMs =
   const fixedArgv = argv.map((arg, i) =>
     argv[i - 1] === "--pi-bin" && !path.isAbsolute(arg) ? path.join(ROOT, arg) : arg,
   );
+  // Keep tests from re-execing under systemd-inhibit.
+  if (!fixedArgv.includes("--prevent-sleep")) fixedArgv.push("--prevent-sleep", "off");
   const { code, stdout, stderr, timedOut } = await new Promise((resolve) => {
     execFile(
       process.execPath,

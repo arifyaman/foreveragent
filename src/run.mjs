@@ -25,6 +25,21 @@ import { checkoutNewBranch } from "./git.mjs";
 
 const RUN_DIRNAME = ".foreveragent";
 
+// Build/test artifacts that agents commonly create and that should never
+// end up in a commit. Excluded locally (via .git/info/exclude) so the
+// clean-tree check stays valid and history stays clean.
+const ARTIFACT_EXCLUDES = [
+  "__pycache__/",
+  "*.pyc",
+  "*.pyo",
+  ".pytest_cache/",
+  ".mypy_cache/",
+  ".ruff_cache/",
+  ".coverage",
+  "htmlcov/",
+  "node_modules/",
+];
+
 export function newRunId() {
   return new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
 }
@@ -86,6 +101,9 @@ export async function runLoop(options) {
   const runDir = path.join(repo, RUN_DIRNAME, "runs", runId);
   await mkdir(runDir, { recursive: true });
   await ensureExcluded(repo, RUN_DIRNAME);
+  for (const entry of ARTIFACT_EXCLUDES) {
+    await ensureExcluded(repo, entry);
+  }
   const log = new RunLog(runDir, print);
 
   const state = {

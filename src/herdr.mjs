@@ -5,6 +5,8 @@
 
 import { execFile } from "node:child_process";
 import { readdir, readFile, stat } from "node:fs/promises";
+import os from "node:os";
+import net from "node:net";
 import path from "node:path";
 import process from "node:process";
 
@@ -56,8 +58,52 @@ function latestRunDir(repo) {
 }
 
 /**
+ * One-shot JSON-RPC call over the herdr unix socket.
+ */
+function herdrSocketPath() {
+  return process.env.HERDR_SOCKET_PATH || path.join(os.homedir(), ".config", "herdr", "herdr.sock");
+}
+
+export function herdrRpc(method, params) {
+  return new Promise((resolve) => {
+    const socket = net.connect(herdrSocketPath());
+    let buffer = "";
+    const finish = (value) => {
+      try {
+        socket.end();
+      } catch {
+        /* ignore */
+      }
+      resolve(value);
+    };
+    socket.setTimeout(10_000, () => {
+      finish({ ok: false, error: "herdr socket timeout" });
+    });
+    socket.on("connect", () => {
+      socket.write(JSON.stringify({ id: "1", method, params }) + "\n");
+    });
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      const line = buffer.split("\n").find((l) => l.trim().startsWith("{"));
+      if (!line) return;
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.error) finish({ ok: false, error: parsed.error.message || JSON.stringify(parsed.error) });
+        else finish({ ok: true, result: parsed.result });
+      } catch {
+        finish({ ok: false, error: `bad herdr response: ${line.slice(0, 200)}` });
+      }
+    });
+    socket.on("error", (error) => finish({ ok: false, error: error.message }));
+  });
+}
+
+/**
  * Create a herdr tab in the current workspace and start a foreveragent run in
  * it. Returns { tabId, paneId, command }.
+ *
+ * The pane is a plain shell, so the command is sent with the pane-level
+ * pane.send_text RPC (agent.send-keys only addresses detected agents).
  */
 export async function spawnRunInTab({ repo, argv, label, workdir = repo }) {
   const workspace = process.env.HERDR_WORKSPACE_ID;
@@ -80,8 +126,8 @@ export async function spawnRunInTab({ repo, argv, label, workdir = repo }) {
   const tabId = parsed?.result?.tab?.tab_id;
   if (!paneId || !tabId) throw new Error(`herdr tab create: missing pane/tab id in ${created.stdout.slice(0, 200)}`);
 
-  const sent = await run(bin, ["agent", "send-keys", paneId, command, "enter"]);
-  if (!sent.ok) throw new Error(`herdr agent send-keys failed: ${sent.error}`);
+  const sent = await herdrRpc("pane.send_text", { pane_id: paneId, text: command + "\r" });
+  if (!sent.ok) throw new Error(`pane.send_text failed: ${sent.error}`);
   return { tabId, paneId, command };
 }
 

@@ -80,6 +80,7 @@ foreveragent "<objective>" [options]
 | `--stop-when <condition>`    | end when the agent reports this condition is met                  | - |
 | `--branch <name>`            | create and switch to a new branch before starting                 | current |
 | `--allow-dirty`              | start even with uncommitted changes                               | off |
+| `--prevent-sleep <on|off>`   | prevent system sleep via systemd-inhibit (Linux, re-execs self) | on  |
 | `--pi-bin <path>`            | agent binary (any pi-compatible CLI; `.js/.mjs` scripts run via node) | `pi` |
 | `--dry-run`                  | print resolved config + iteration 1 prompt, exit                 | - |
 | `--json`                     | print the final state as JSON on stdout                          | - |

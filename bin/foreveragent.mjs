@@ -37,6 +37,7 @@ Run options:
   --max-no-ops <n>            stop after n consecutive no-op iterations (default 3)
   --max-wall-time <dur>       stop after a wall-time cap, e.g. 8h, 45m (default: 0)
   --agent-timeout <dur>       per-iteration agent timeout (default: 30m)
+  --prevent-sleep <on|off>    prevent system sleep via systemd-inhibit (Linux) (default: on)
   --stop-when <condition>     end when the agent reports this condition is met
   --branch <name>             create and switch to a new branch first
   --allow-dirty               start even with uncommitted changes
@@ -116,6 +117,9 @@ function parseArgs(argv) {
       case "--allow-dirty":
         options.allowDirty = true;
         break;
+      case "--prevent-sleep":
+        options.preventSleep = takeValue(arg); // "on" | "off"
+        break;
       case "--pi-bin":
         options.piBin = takeValue(arg);
         break;
@@ -158,6 +162,59 @@ function overridesFromOptions(options) {
   return overrides;
 }
 
+/**
+ * Re-exec the whole run under systemd-inhibit (Linux) so the machine does
+ * not sleep overnight. Returns the exit code when a re-exec happened, or
+ * null to continue in-process.
+ */
+async function preventSleepGuard(options) {
+  if (options.preventSleep === "off") return null;
+  if (process.platform !== "linux") return null;
+  if (process.env.FA_INHIBITED === "1") return null;
+  let hasInhibit = false;
+  try {
+    const { execFileSync } = await import("node:child_process");
+    execFileSync("which", ["systemd-inhibit"], { stdio: "ignore" });
+    hasInhibit = true;
+  } catch {
+    hasInhibit = false;
+  }
+  if (!hasInhibit) {
+    console.log("note: systemd-inhibit not found; sleep prevention skipped");
+    return null;
+  }
+  const { spawn } = await import("node:child_process");
+  const child = spawn(
+    "systemd-inhibit",
+    [
+      "--what=idle",
+      "--what=suspend",
+      "--what=handle-lid-switch",
+      "--who=foreveragent",
+      `--why=foreveragent run on ${process.cwd()}`,
+      "--mode",
+      "block",
+      process.execPath,
+      BIN_PATH,
+      ...process.argv.slice(2),
+    ],
+    { stdio: "inherit", env: { ...process.env, FA_INHIBITED: "1" } },
+  );
+  const forward = (name) => {
+    process.on(name, () => {
+      try {
+        child.kill(name === "SIGINT" ? "SIGINT" : "SIGTERM");
+      } catch {
+        /* already gone */
+      }
+    });
+  };
+  forward("SIGINT");
+  forward("SIGTERM");
+  const code = await new Promise((resolve) => child.on("close", (c) => resolve(c ?? 1)));
+  return code;
+}
+
 async function commandRun(options) {
   const repo = process.cwd();
   const objective = options.positionals[0];
@@ -178,6 +235,9 @@ async function commandRun(options) {
     console.log(buildIterationPrompt({ n: 1, runId: "<runId>", objective, stopWhen: options.stopWhen }));
     return 0;
   }
+
+  const code = await preventSleepGuard(options);
+  if (code !== null) return code;
 
   const controller = new AbortController();
   const onSignal = (name) => {
@@ -207,35 +267,45 @@ async function commandRun(options) {
 
 async function commandSpawn(options) {
   const repo = process.cwd();
-  const rest = options.positionals.slice(1);
-  if (rest.length === 0) {
+  const objective = options.positionals[0];
+  if (!objective) {
     console.error("usage: foreveragent spawn <objective> [run options...]");
     process.exit(1);
   }
-  // Re-parse the rest as run options (minus the objective positional).
-  const runOptions = parseArgs(rest);
-  runOptions.positionals = [rest[0], ...runOptions.positionals.slice(1)];
 
+  // Resolve the config to validate the model list before detaching the run.
   const { config: fileConfig } = await loadConfigFile(repo, options.config);
-  const config = resolveConfig(fileConfig, overridesFromOptions(runOptions));
+  resolveConfig(fileConfig, overridesFromOptions(options));
 
-  // Build the argv to send to the tab.
-  const argv = [rest[0]];
-  for (const key of ["models", "model", "thinking", "config", "branch", "piBin"]) {
-    if (runOptions[key] !== undefined) {
-      const flag = key === "models" ? "--models" : key === "model" ? "--model" : key === "thinking" ? "--thinking" : key === "config" ? "--config" : key === "branch" ? "--branch" : "--pi-bin";
-      argv.push(flag, runOptions[key].join ? runOptions[key].join(",") : String(runOptions[key]));
-    }
+  // Build the argv to send to the tab (flags only; values re-parsed there).
+  const argv = [objective];
+  if (options.models) argv.push("--models", ...options.models);
+  if (options.model) argv.push("--model", options.model);
+  if (options.thinking !== undefined) argv.push("--thinking", options.thinking);
+  if (options.config !== undefined) argv.push("--config", options.config);
+  if (options.branch !== undefined) argv.push("--branch", options.branch);
+  if (options.piBin !== undefined) argv.push("--pi-bin", options.piBin);
+  // Durations are re-parsed on the far side, so send them in human units.
+  const durationArg = (ms) => {
+    if (ms % 3_600_000 === 0) return `${ms / 3_600_000}h`;
+    if (ms % 60_000 === 0) return `${ms / 60_000}m`;
+    if (ms % 1000 === 0) return `${ms / 1000}s`;
+    return `${ms}ms`;
+  };
+  for (const [key, flag, isDuration] of [
+    ["maxIterations", "--max-iterations", false],
+    ["maxConsecutiveFailures", "--max-consecutive-failures", false],
+    ["maxNoOps", "--max-no-ops", false],
+    ["maxWallTimeMs", "--max-wall-time", true],
+    ["agentTimeoutMs", "--agent-timeout", true],
+  ]) {
+    if (options[key] !== undefined) argv.push(flag, isDuration ? durationArg(options[key]) : String(options[key]));
   }
-  for (const key of ["maxIterations", "maxConsecutiveFailures", "maxNoOps", "maxWallTimeMs", "agentTimeoutMs"]) {
-    if (runOptions[key] !== undefined) {
-      argv.push(`--${key.toLowerCase().replace(/([A-Z])/g, "-$1")}`, String(runOptions[key]));
-    }
-  }
-  if (runOptions.stopWhen !== undefined) argv.push("--stop-when", runOptions.stopWhen);
-  if (runOptions.allowDirty) argv.push("--allow-dirty");
+  if (options.stopWhen !== undefined) argv.push("--stop-when", options.stopWhen);
+  if (options.allowDirty) argv.push("--allow-dirty");
+  if (options.dryRun) argv.push("--dry-run");
 
-  const label = (rest[0].match(/^[a-z0-9]+/i) || ["fa"])[0].slice(0, 8);
+  const label = (objective.match(/^[a-z0-9]+/i) || ["fa"]).slice(0, 8)[0] || "fa";
   const { tabId, paneId, command } = await spawnRunInTab({ repo, argv, label: `fa-${label}` });
   console.log(`started foreveragent in herdr tab ${tabId} (pane ${paneId})`);
   console.log(`command: ${command}`);

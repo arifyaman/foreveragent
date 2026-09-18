@@ -55,6 +55,7 @@ test("adds .foreveragent to git info/exclude and keeps tree clean of run data", 
   assert.equal(result.code, 0, result.stderr);
   const exclude = await readRepoFile(repo, ".git/info/exclude");
   assert.match(exclude, /foreveragent/);
+  assert.match(exclude, /__pycache__/);
   // Only the iteration commit should touch tracked files.
   assert.equal(await commits(repo), 1);
 });
