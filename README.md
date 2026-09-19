@@ -15,6 +15,143 @@ foreveragent "improve the test coverage of src/" --max-iterations 20
 You wake up to a branch with one small committed step per iteration, a log of
 everything that happened, and (hopefully) the objective done.
 
+## Getting started
+
+### Requirements
+
+- Node.js >= 20 and git.
+- [pi](https://pi.dev) installed and logged in (`pi` interactive works, and
+  `pi --list-models` shows at least two models you can use - the failover
+  list is the point, so configure more than one provider).
+- Optional: [herdr](https://herdr.dev) if you want runs in visible tabs.
+
+### 1. Point it at a git repo
+
+Any git repo with a clean tree and at least one initial commit. Drop a config
+file at the repo root (or pass `--models` every time):
+
+```sh
+# foreveragent.json in the repo root
+{
+  "models": [
+    "llama.cpp/Qwen3.8-27B-UD-IQ4_XS",   # cheap local model first
+    "github-copilot/claude-sonnet-5",    # failover
+    "opencode/gpt-5.4-mini"              # failover
+  ],
+  "thinking": "low",
+  "agentTimeoutMs": 1800000
+}
+```
+
+The order is the failover order. Anything the first model can do cheaply gets
+done by it; when it rate-limits or errors, the next model takes over the same
+iteration automatically.
+
+### 2. Do a dry run first
+
+```sh
+cd your-repo
+node /path/to/foreverAgent/bin/foreveragent.mjs "your objective here" --dry-run
+```
+
+This prints the resolved config (model list, caps) and the exact iteration 1
+prompt without running anything. Fix whatever looks wrong before spending
+tokens.
+
+### 3. Small supervised run
+
+Start with a bounded, verifiable objective and a small cap. Watch it:
+
+```sh
+node /path/to/foreverAgent/bin/foreveragent.mjs \
+  "Add a unit test for the bug where addTask('') crashes, then fix the bug" \
+  --max-iterations 3 --agent-timeout 10m
+```
+
+Expected shape of each iteration on the terminal:
+
+```
+--- iteration 2 ---
+  model: github-copilot/claude-sonnet-5 (thinking: low)
+  ok: fixed empty-title crash in store.mjs, added 3 regression tests. (commit 2)
+```
+
+Line meanings:
+
+| Line prefix | Meaning |
+| ----------- | ------- |
+| `  ok: ... (commit N)` | iteration succeeded and was committed |
+| `  failed: ... (N consecutive)` | agent reported failure; work rolled back |
+| `  no-op: no file changes (N in a row)` | success but nothing changed; too many stalls the run |
+| `  ! <model>: <kind> - <message>` | model error; next model in the list is tried for the same iteration |
+| `  waiting <dur> before next model attempt` | honoring a rate-limit reset time |
+| `  ! commit failed: ...` | rare; work kept uncommitted for the next iteration to repair |
+
+### 4. The overnight pattern
+
+Two ingredients make a good overnight run:
+
+1. **A checklist objective.** A `ROADMAP.md` with small, verifiable items and
+   a definition of done. Tell the agent to work through it one item at a time.
+2. **A `--stop-when` condition** the agent can truthfully check each
+   iteration, e.g. `"all roadmap items checked and npm test passes"`.
+
+Inside a herdr workspace, start it in a visible tab:
+
+```sh
+foreveragent spawn "Work through ROADMAP.md in order, one item per iteration, checking each off only after its verification passes." \
+  --stop-when "Every item in ROADMAP.md is checked and npm test passes" \
+  --max-iterations 20 --max-wall-time 8h
+```
+
+`spawn` creates the tab, returns its id, and the run is visible under
+`herdr tab focus <tabId>`. On Linux the run re-execs itself under
+`systemd-inhibit` so the machine does not sleep (disable with
+`--prevent-sleep off`).
+
+Real-world reference: the demo run that built this project's sibling repo
+(`/home/xlip/work/xlip/foreverAgent-demo`, a task CLI) finished all 10 roadmap
+items in 10 iterations, 10 commits, 0 failures, ~19 minutes, local model
+only - failover never even fired.
+
+### 5. Read the results
+
+```sh
+git log --oneline        # one reviewable commit per iteration
+git show <sha>           # what that iteration actually changed
+
+foreveragent status      # live/latest run state (JSON)
+foreveragent logs -n 50  # last 50 run.log events
+```
+
+Run data lives in `.foreveragent/runs/<runId>/`:
+
+| File                    | What it is                                              |
+| ----------------------- | ------------------------------------------------------- |
+| `run.log`               | JSONL event log: iterations, model state changes, waits, stop reason |
+| `state.json`            | live pid + counters (used by `status`/`stop`)           |
+| `prompt.md`             | the exact iteration 1 prompt                            |
+| `notes.md`              | shared memory: what the agent told past iterations      |
+| `iteration-N-attempt-M.jsonl` | raw pi output stream for that attempt (debug goldmine) |
+
+The final terminal summary (also `foreveragent status` after the run) gives
+the stop reason, iteration/commit/failure counts, per-model state, and total
+work. A `model_cooldown` / `model_dead` / `failover_wait` event in `run.log`
+tells you exactly when and why a model was swapped.
+
+### Troubleshooting
+
+| Symptom | What it means / do |
+| ------- | ------------------- |
+| `working tree is not clean` | commit or stash first, or `--allow-dirty` (then the first commit may include your dirty files) |
+| `no usable models` | `pi --list-models` - check login (copilot) or local server (llama.cpp) |
+| run stops with `all_models_dead` | every model hit an unrecoverable error (auth/credits/unknown model). Fix the provider, re-run - iterations already committed are kept |
+| run stops with `stalled` | agent made no file changes N times in a row. Usually the objective is too vague or the model too weak; sharpen it, or put a stronger model earlier in the list |
+| run stops with `consecutive_failures` | iterations keep failing their verification. Look at the summaries in `run.log`; often the objective asks for more than one small step per iteration |
+| model rate-limited all night | check `failover_wait` events; raise `failover.rateLimitMaxWaitMs` or add another provider to the list |
+| you want to stop it | `foreveragent stop` (SIGINT; current iteration is killed, committed work is kept, stop reason `interrupted`) |
+| agent committed junk (pyc files, caches) | build/test artifact paths are auto-excluded via `.git/info/exclude`; for anything else, add it to the repo's `.gitignore` |
+
 ## How it works
 
 Each iteration:
