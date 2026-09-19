@@ -25,18 +25,46 @@ everything that happened, and (hopefully) the objective done.
   list is the point, so configure more than one provider).
 - Optional: [herdr](https://herdr.dev) if you want runs in visible tabs.
 
-### 1. Point it at a git repo
+### 1. Pick a target project (there is nothing to "point")
 
-Any git repo with a clean tree and at least one initial commit. Drop a config
-file at the repo root (or pass `--models` every time):
+There is no registration, no global config, and no flag that names the repo.
+The target project is simply **the git repo you run the command from**: the
+tool uses your current working directory, checks that it is a git repo with a
+clean tree and at least one commit, and does all of its work there (commits,
+`.foreveragent/` run state, the local git excludes). So "pointing it at a
+project" = `cd` into that project and run.
+
+One-time setup so the command works from anywhere (pick one):
 
 ```sh
-# foreveragent.json in the repo root
+# option A: npm link (adds `foreveragent` to your PATH)
+cd /home/xlip/work/xlip/foreverAgent && npm link
+
+# option B: a shell alias/alias-free shortcut
+alias foreveragent='node /home/xlip/work/xlip/foreverAgent/bin/foreveragent.mjs'
+
+# option C: no setup - just call it by path every time
+node /home/xlip/work/xlip/foreverAgent/bin/foreveragent.mjs ...
+```
+
+Then, in any project:
+
+```sh
+cd /home/xlip/work/some/other-project     # the target is wherever you stand
+foreveragent "fix the flaky parser test" --dry-run
+```
+
+Each project can carry its own config by dropping a `foreveragent.json` in the
+directory you run from (convention: the repo root); without it, pass
+`--models` on the command line instead:
+
+```json
+// /home/xlip/work/some/other-project/foreveragent.json
 {
   "models": [
-    "llama.cpp/Qwen3.8-27B-UD-IQ4_XS",   # cheap local model first
-    "github-copilot/claude-sonnet-5",    # failover
-    "opencode/gpt-5.4-mini"              # failover
+    "llama.cpp/Qwen3.8-27B-UD-IQ4_XS",   // cheap local model first
+    "github-copilot/claude-sonnet-5",    // failover
+    "opencode/gpt-5.4-mini"              // failover
   ],
   "thinking": "low",
   "agentTimeoutMs": 1800000
