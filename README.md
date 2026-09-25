@@ -1,11 +1,10 @@
 # foreveragent
 
-A minimal autonomous agent loop, in the spirit of
-[gnhf](https://github.com/kunchenguid/gnhf) ("good night, have fun") but
-deliberately small: one dependency-free Node.js program that keeps a coding
-agent working on an objective until a stopping point is reached, and at each
-point does the boring work for it - committing successes, rolling back
-failures, switching to another model when the current one errors.
+A minimal autonomous agent loop, deliberately small: one dependency-free
+Node.js program that keeps a coding agent working on an objective until a
+stopping point is reached, and at each point does the boring work for it -
+committing successes, rolling back failures, switching to another model when
+the current one errors.
 
 ```
 foreveragent "improve the test coverage of src/" --max-iterations 20
@@ -311,6 +310,9 @@ agent sessions. Subcommands (run from the repo):
 # start a run in a NEW herdr tab of your current workspace (visible, focusable):
 foreveragent spawn "<objective>" --max-iterations 20 --stop-when "tests pass"
 
+# same, but each iteration gets its OWN persistent tab (see "tabs mode" below):
+foreveragent tabs "<objective>" --max-iterations 20 --stop-when "tests pass"
+
 # watch / manage:
 foreveragent status          # latest run state (or: status <run-id>)
 foreveragent logs -n 50      # tail the run log
@@ -319,8 +321,44 @@ foreveragent stop            # SIGINT the live run (clean stop after current cal
 # in herdr: herdr tab focus <tabId> to watch the run's terminal
 ```
 
-`spawn` is only available inside a herdr workspace (`HERDR_WORKSPACE_ID`);
-outside herdr, run the plain command directly.
+`spawn` and `tabs` are only available inside a herdr workspace
+(`HERDR_WORKSPACE_ID`); outside herdr, run the plain command directly.
+
+### tabs mode (one iteration per tab)
+
+`spawn` puts the whole run in a single tab. `tabs` instead opens a **separate,
+persistent tab for every iteration**, so you can open iteration 1, 2, 3, ... side
+by side and compare exactly what each one did. Use it when you want to review
+per-iteration behavior rather than watch one long stream.
+
+```sh
+foreveragent tabs "improve the test coverage of src/" \
+  --model "llama.cpp/Qwen3.8-27B-UD-IQ4_XS" \
+  --max-iterations 20 --agent-timeout 300s --allow-dirty
+```
+
+How it differs from `spawn` / the plain run:
+
+- **Layout.** A `foreveragent (tabs)` orchestrator tab plus one `Iteration N`
+  tab per iteration. Tabs are **never auto-closed** - you control their
+  lifetime and can scroll each one's history after the run ends.
+- **What you see in each iteration tab.** The iteration runs `pi` in
+  non-interactive JSON mode and the child renders the event stream as a readable
+  feed: `→ <tool call>`, `✓ <tool done>`, `▪ <assistant message>`, then the final
+  result JSON and a `SUCCESS` / `FAILURE` / `ERROR` banner. It is a scrollable
+  log, not the live full-screen pi TUI (see Design notes).
+- **Completion detection.** Each iteration tab runs a child process that writes
+  `iter-result.json` into the run dir; the orchestrator polls that file to know
+  when the iteration finished (the tab pane is fire-and-forget).
+- **Shared memory.** As in the plain run, `notes.md` carries what each iteration
+  learned into the next iteration's prompt.
+
+Run data in tabs mode is the same `run.log` / `state.json` / `prompt.md` /
+`notes.md` set, plus `child-config.json` and `iter-result.json` for the
+*current* iteration. The per-attempt `iteration-N-attempt-M.jsonl` streams from
+the plain run are **not** written in tabs mode - the events are rendered live to
+the pane instead (the full picture is still recoverable from the tab's own
+scrollback and `run.log`).
 
 ## Tests
 
@@ -345,9 +383,9 @@ npm test
 - **pi as the agent, model via flag.** All failover is expressed as "run the
   same iteration with `--model <other>`", so adding a provider is a config
   line, not code.
-- **Commit on success, roll back on failure** - the same contract as gnhf:
-  the branch is always in a valid state, every iteration is a reviewable
-  commit, and nothing unverified ever survives.
+- **Commit on success, roll back on failure.** The branch is always in a valid
+  state, every iteration is a reviewable commit, and nothing unverified ever
+  survives.
 - **Local-only exclusion.** Run data is hidden via `.git/info/exclude`
   (never `.gitignore`), so the clean-tree check stays true and the repo
   history contains only intentional work.
