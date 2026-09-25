@@ -12,6 +12,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { resolveConfig } from "../src/config.mjs";
 import { newRunId, runLoop } from "../src/run.mjs";
+import { runTabs } from "../src/tabs.mjs";
 import { buildIterationPrompt } from "../src/prompts.mjs";
 import { parseDuration } from "../src/log.mjs";
 import { spawnRunInTab, readState, stopRun, tailLog } from "../src/herdr.mjs";
@@ -22,7 +23,8 @@ const HELP = `foreveragent - run pi until the objective is met, committing progr
 
 Usage:
   foreveragent <objective> [options]
-  foreveragent spawn <objective> [options]     start a run in a new herdr tab
+  foreveragent spawn <objective> [options]     start a run in a new herdr tab (single pane)
+  foreveragent tabs <objective> [options]      start a run with each iteration in its own herdr tab
   foreveragent status [run-id]                 show the latest (or given) run state
   foreveragent logs [run-id] [-n lines]        tail the run log
   foreveragent stop [run-id]                   stop the active run (SIGINT)
@@ -314,6 +316,58 @@ async function commandSpawn(options) {
   return 0;
 }
 
+async function commandTabs(options) {
+  const repo = process.cwd();
+  const objective = options.positionals[0];
+  if (!objective) {
+    console.error("usage: foreveragent tabs <objective> [run options...]");
+    process.exit(1);
+  }
+
+  // Resolve the config.
+  const { config: fileConfig } = await loadConfigFile(repo, options.config);
+  const config = resolveConfig(fileConfig, overridesFromOptions(options));
+
+  if (options.dryRun) {
+    console.log(`config file:   ${fileConfig.configPath || "(none - defaults)"}`);
+    console.log(`models:        ${config.models.map((m) => m.model).join(" -> ")}`);
+    console.log(`mode:          tabs (each iteration in its own herdr tab)`);
+    console.log("");
+    console.log(buildIterationPrompt({ n: 1, runId: "<runId>", objective, stopWhen: options.stopWhen }));
+    return 0;
+  }
+
+  // Check herdr workspace
+  const workspaceId = process.env.HERDR_WORKSPACE_ID;
+  if (!workspaceId) {
+    console.error("foreveragent tabs requires HERDR_WORKSPACE_ID (run inside a herdr workspace)");
+    console.error("Tip: start herdr, then run 'pi' inside it to set up the environment");
+    return 1;
+  }
+
+  const controller = new AbortController();
+  const onSignal = (name) => {
+    if (controller.signal.aborted) return;
+    console.log(`\nreceived ${name}, stopping run...`);
+    controller.abort();
+  };
+  process.on("SIGINT", () => onSignal("SIGINT"));
+  process.on("SIGTERM", () => onSignal("SIGTERM"));
+
+  const runId = newRunId();
+  const state = await runTabs({
+    repo,
+    objective,
+    stopWhen: options.stopWhen,
+    config,
+    runId,
+    branch: options.branch,
+    allowDirty: options.allowDirty,
+    workspaceId,
+  });
+  return state.exitCode ?? 0;
+}
+
 async function commandStatus(options) {
   const repo = process.cwd();
   const found = await readState(repo, options.positionals[0]);
@@ -356,10 +410,11 @@ async function main() {
     process.exit(argv.length === 0 ? 1 : 0);
   }
   const [subcommand, ...rest] = argv;
-  if (["spawn", "status", "logs", "stop"].includes(subcommand)) {
+  if (["spawn", "tabs", "status", "logs", "stop"].includes(subcommand)) {
     const options = parseArgs(rest);
     let code;
     if (subcommand === "spawn") code = await commandSpawn(options);
+    else if (subcommand === "tabs") code = await commandTabs(options);
     else if (subcommand === "status") code = await commandStatus(options);
     else if (subcommand === "logs") code = await commandLogs(options);
     else code = await commandStop(options);
