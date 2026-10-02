@@ -180,6 +180,9 @@ export async function runTabs(options) {
     currentModel: config.models[0].model,
     modelStates: [], status: "running", reason: null,
     repo, tabs: [],
+    // Recorded so `foreveragent stop` can SIGINT this supervisor (tabs mode
+    // previously omitted it, making stop a silent no-op).
+    pid: process.pid,
   };
 
   // --- setup ---------------------------------------------------------------
@@ -388,7 +391,7 @@ export async function runTabs(options) {
         `[tabs]   no-op: no file changes (${consecutiveNoOps} in a row)`);
       appendNotes(runDir, notesEntry({ iteration, model: usedModel.model, outcome: { state: "no-op", summary: result.summary, changes: result.keyChanges, learnings: result.keyLearnings } }));
       if (result.shouldStop) return finish(stopWhen ? "stop_condition" : "done");
-      if (consecutiveNoOps >= config.maxNoOps) return finish("stalled");
+      if (config.maxNoOps > 0 && consecutiveNoOps >= config.maxNoOps) return finish("stalled");
       persistState();
       continue;
     }

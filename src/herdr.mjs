@@ -143,19 +143,68 @@ export async function readState(repo, runId) {
   }
 }
 
+/**
+ * Best-effort discovery of a running foreveragent supervisor for state that
+ * predates the `pid` field (old tabs-mode runs). Scans /proc on Linux for a
+ * node process whose argv starts with foreveragent.mjs; excludes our own
+ * process. Returns null when nothing plausible is found or off-Linux.
+ */
+async function discoverSupervisorPid() {
+  if (process.platform !== "linux") return null;
+  const { readdirSync, readFileSync } = await import("node:fs");
+  let entries; 
+  try {
+    entries = await readdirSync("/proc", { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  const candidates = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry.name)) continue;
+    let argv; 
+    try {
+      argv = readFileSync(`/proc/${entry.name}/cmdline`, "utf8").split("\0");
+    } catch {
+      continue;
+    }
+    const script = argv[1] || "";
+    if (!script.endsWith("foreveragent.mjs")) continue;
+    const pid = Number(entry.name);
+    if (pid === process.pid || pid === process.ppid) continue;
+    candidates.push(pid);
+  }
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
 /** Send SIGINT to the running process recorded in state.json. */
 export async function stopRun(repo, runId) {
   const found = await readState(repo, runId);
   if (!found) throw new Error("no run found (no .foreveragent/runs/*/state.json)");
   const { state } = found;
-  if (state.status !== "running" || !state.pid) {
+  if (state.status !== "running") {
     return { stopped: false, state, note: "run is not active" };
   }
+  let pid = state.pid;
+  let discovered = false;
+  if (!pid) {
+    // Old tabs-mode state has no pid; try to find the live supervisor.
+    pid = await discoverSupervisorPid();
+    discovered = Boolean(pid);
+    if (!pid) {
+      return { stopped: false, state, note: "run is active but no supervisor pid is recorded and none was found; kill the foreveragent process manually" };
+    }
+  }
   try {
-    process.kill(state.pid, "SIGINT");
-    return { stopped: true, state, note: `SIGINT sent to pid ${state.pid}` };
+    process.kill(pid, "SIGINT");
+    const note = discovered
+      ? `SIGINT sent to discovered supervisor pid ${pid} (state.json had no pid; re-run start to record one)`
+      : `SIGINT sent to pid ${pid}`;
+    return { stopped: true, state, note };
   } catch (error) {
-    return { stopped: false, state, note: `could not signal pid ${state.pid}: ${error.message}` };
+    if (discovered) {
+      return { stopped: false, state, note: `could not signal discovered pid ${pid}: ${error.message}` };
+    }
+    return { stopped: false, state, note: `could not signal pid ${pid}: ${error.message}` };
   }
 }
 
