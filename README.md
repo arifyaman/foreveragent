@@ -123,6 +123,12 @@ Two ingredients make a good overnight run:
 2. **A `--stop-when` condition** the agent can truthfully check each
    iteration, e.g. `"all roadmap items checked and npm test passes"`.
 
+   Leave it out when you want an endless improvement run: the agent is
+   then told the run never ends on its own and, once the objective is
+   met, must keep finding things to improve and dig into the most
+   promising one every iteration - it will only stop when you stop it
+   (or a cap is hit).
+
 Inside a herdr workspace, start it in a visible tab:
 
 ```sh
@@ -204,11 +210,11 @@ Stopping points ("run until some points do somethings"):
 
 | Reason                 | What happens                                                        |
 | ---------------------- | ------------------------------------------------------------------- |
-| `done`                | agent set `should_stop: true` (objective met); last work committed  |
+| `done`                | agent set `should_stop: true` (objective met; only when `--stop-when` is given); last work committed |
 | `stop_condition`      | agent reported the `--stop-when` condition as fully met             |
 | `max_iterations`      | reached `--max-iterations`                                          |
 | `max_wall_time`       | reached `--max-wall-time`                                           |
-| `stalled`             | `--max-no-ops` consecutive iterations without file changes (default 3) |
+| `stalled`             | `--max-no-ops` consecutive iterations without file changes (default 3, 0 disables) |
 | `consecutive_failures`| `--max-consecutive-failures` failed iterations in a row (default 3) |
 | `all_models_dead`     | every model in the list is dead for this run                        |
 | `agent_errors_exhausted` | too many unexplained agent errors across all models            |
@@ -238,7 +244,7 @@ foreveragent "<objective>" [options]
 | `--config <path>`            | config file (default `foreveragent.json` in the repo root)        |         |
 | `--max-iterations <n>`       | stop after n iterations (0 = unlimited)                          | 0 |
 | `--max-consecutive-failures <n>` | stop after n consecutive failed iterations                   | 3 |
-| `--max-no-ops <n>`           | stop after n consecutive no-op iterations                        | 3 |
+| `--max-no-ops <n>`           | stop after n consecutive no-op iterations (0 = disabled) | 3 |
 | `--max-wall-time <dur>`      | stop after a wall-time cap (`8h`, `45m`, `90s`)                  | 0 |
 | `--agent-timeout <dur>`      | per-iteration agent timeout (a timeout is a model error)          | 30m |
 | `--stop-when <condition>`    | end when the agent reports this condition is met                  | - |
