@@ -356,7 +356,7 @@ export async function runLoop(options) {
       if (result.shouldStop) {
         return finish(stopWhen ? "stop_condition" : "done", 0);
       }
-      if (consecutiveNoOps >= config.maxNoOps) {
+      if (config.maxNoOps > 0 && consecutiveNoOps >= config.maxNoOps) {
         return finish("stalled", 0);
       }
       persistState();
