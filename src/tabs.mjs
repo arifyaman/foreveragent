@@ -78,6 +78,39 @@ async function sendToPane(paneId, text) {
   try { await exec(herdrBin(), ["pane", "send-keys", paneId, text]); } catch { /* non-critical */ }
 }
 
+// Grace window after SIGINT/SIGTERM for an in-flight iteration to finish on
+// its own before we kill it. Override with FA_DRAIN_GRACE_MS.
+const DRAIN_GRACE_MS = Number(process.env.FA_DRAIN_GRACE_MS) || 60_000;
+
+/** SIGTERM a pane's foreground process group, then wait for it to exit. */
+async function killPaneProcessGroup(paneId) {
+  try {
+    const result = await exec(herdrBin(), ["pane", "process-info", "--pane", paneId], 10_000);
+    if (!result.ok) return;
+    const parsed = JSON.parse(result.stdout);
+    const pgid = parsed?.result?.process_info?.foreground_process_group_id;
+    if (typeof pgid !== "number") return;
+    try {
+      process.kill(-pgid, "SIGTERM");
+    } catch {
+      try { process.kill(pgid, "SIGTERM"); } catch { /* already gone */ }
+    }
+    // Wait for the killed process group to disappear (best effort).
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const r = await exec(herdrBin(), ["pane", "process-info", "--pane", paneId], 5_000);
+      if (!r.ok) return;
+      try {
+        const p = JSON.parse(r.stdout);
+        const fg = p?.result?.process_info?.foreground_process_group_id;
+        // fg changed or disappeared: the killed group is gone.
+        if (fg === undefined || fg === null || fg !== pgid) return;
+      } catch { return; }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  } catch { /* best effort */ }
+}
+
 /** Try to reuse an existing idle pane as orchestrator (best effort). */
 async function findReusableTab(workspaceId, cwd) {
   const result = await exec(herdrBin(), ["pane", "list", "--workspace", workspaceId]);
@@ -115,14 +148,20 @@ export async function spawnIterationTab(workspaceId, cwd, label, childConfig) {
 }
 
 export async function spawnIterationChild(childConfig, signal) {
+  // Write the config file the child reads (spawnIterationTab does the same).
+  writeFileSync(join(childConfig.runDir, "child-config.json"), JSON.stringify(childConfig));
   return new Promise((resolve) => {
+    // Detached: the child gets its own process group so it can be killed as a
+    // group (node tabs-child.mjs + its pi subprocess) without touching the
+    // orchestrator itself.
     const child = spawn(process.execPath, [TABS_CHILD_SCRIPT], {
       stdio: ["pipe", "inherit", "inherit"],
       env: { ...process.env, FA_RUN_DIR: childConfig.runDir },
+      detached: process.platform !== "win32",
     });
     child.stdin.write(JSON.stringify(childConfig));
     child.stdin.end();
-    signal?.addEventListener("abort", () => { try { child.kill("SIGTERM"); } catch {} });
+    signal?.addEventListener("abort", () => killChildProcessGroup(child));
     child.on("close", (code) => {
       const resultPath = join(childConfig.runDir, "iter-result.json");
       let result;
@@ -131,6 +170,17 @@ export async function spawnIterationChild(childConfig, signal) {
       resolve({ result, exitCode: code });
     });
   });
+}
+
+/** SIGTERM a detached child's whole process group (best effort). */
+function killChildProcessGroup(child) {
+  try {
+    if (child.pid) {
+      process.kill(-child.pid, "SIGTERM");
+      return;
+    }
+  } catch { /* group kill unavailable */ }
+  try { child.kill("SIGTERM"); } catch { /* already gone */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -217,9 +267,10 @@ export async function runTabs(options) {
   persistState();
 
   const finish = async (reason) => {
-    state.status = "complete";
+    state.status = reason === "interrupted" ? "interrupted" : "complete";
     state.reason = reason;
     state.finishedAt = new Date().toISOString();
+    if (drainTimer) clearTimeout(drainTimer);
     persistState();
     const work = await diffStat(repo, startHead).catch(() => "");
     log.event("run_end", { reason, ...state, work }, null);
@@ -266,12 +317,37 @@ export async function runTabs(options) {
 
   // --- Main loop -----------------------------------------------------------
   let consecutiveFailures = 0, consecutiveNoOps = 0;
-  let running = true;
-  const onSignal = () => { if (!running) return; running = false; log.info("[tabs] received signal, stopping..."); };
+  let stopRequested = false;
+  let signalCount = 0;
+  let graceUntil = 0;
+  let drainTimer = null;
+  let childAbort = null;
+  const onSignal = () => {
+    signalCount += 1;
+    if (signalCount >= 2) {
+      // Second signal: stop being graceful and abort the in-flight iteration.
+      stopRequested = true;
+      graceUntil = 0;
+      childAbort?.abort();
+      log.info("[tabs] second signal - aborting the in-flight iteration now");
+      return;
+    }
+    if (stopRequested) return;
+    stopRequested = true;
+    graceUntil = Date.now() + DRAIN_GRACE_MS;
+    log.info(`[tabs] received signal - draining the in-flight iteration (up to ${Math.round(DRAIN_GRACE_MS / 1000)}s, Ctrl-C again to abort now)...`);
+    drainTimer = setTimeout(() => childAbort?.abort(), DRAIN_GRACE_MS);
+    drainTimer.unref?.();
+  };
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
 
-  while (running) {
+  const setTabStatus = (status) => {
+    const last = state.tabs[state.tabs.length - 1];
+    if (last) last.status = status;
+  };
+
+  while (!stopRequested) {
     if (config.maxIterations > 0 && state.iteration >= config.maxIterations) return finish("max_iterations");
 
     state.iteration += 1;
@@ -287,6 +363,7 @@ export async function runTabs(options) {
     let outcome, usedModel = failover.current(), attempt = 0;
 
     for (;;) {
+      if (stopRequested) return finish("interrupted");
       attempt += 1;
       usedModel = failover.current();
       log.info(`[tabs]   model: ${usedModel.model}${usedModel.thinking ? ` (thinking: ${usedModel.thinking})` : ""}${attempt > 1 ? ` [attempt ${attempt}]` : ""}`);
@@ -307,20 +384,36 @@ export async function runTabs(options) {
             workspaceId, repo, tabLabel, childConfig,
           );
           log.info(`[tabs]   iteration ${iteration} in tab ${tabId}, pane ${paneId}`);
-          state.tabs.push({ iteration, tabId, paneId, status: "spawning" });
+          state.tabs.push({ iteration, tabId, paneId, status: "running" });
 
-          // Poll for result
+          // Poll for result. On interrupt, keep polling until the grace window
+          // ends so the in-flight iteration can finish cleanly (drain).
           let elapsed = 0;
           const maxWaitMs = config.agentTimeoutMs || 30 * 60 * 1000;
           const resultPath = join(runDir, "iter-result.json");
 
-          while (elapsed < maxWaitMs && running && !existsSync(resultPath)) {
+          while (elapsed < maxWaitMs && !existsSync(resultPath)) {
+            if (stopRequested && Date.now() >= graceUntil) break;
             await new Promise((r) => setTimeout(r, 2000));
             elapsed += 2000;
           }
 
           if (!existsSync(resultPath)) {
+            if (stopRequested) {
+              // Grace window expired: the child is still running. Kill it (the
+              // pane's foreground process group includes node tabs-child.mjs
+              // and pi), roll back deliberately, and stop.
+              log.info(`[tabs] grace window expired - killing the in-flight iteration`);
+              await killPaneProcessGroup(paneId);
+              setTabStatus("interrupted");
+              appendNotes(runDir, notesEntry({ iteration, model: usedModel.model, outcome: { state: "interrupted", summary: "iteration interrupted while draining", changes: [], learnings: [] } }));
+              await rollback(repo).catch(() => {});
+              clearTimeout(drainTimer);
+              childAbort?.abort();
+              return finish("interrupted");
+            }
             outcome = { ok: false, kind: "timeout", message: `iteration ${iteration} timed out after ${formatDuration(elapsed)}` };
+            setTabStatus("timeout");
           } else {
             const resultData = JSON.parse(readFileSync(resultPath, "utf8"));
             outcome = {
@@ -328,12 +421,27 @@ export async function runTabs(options) {
               text: resultData.text, usage: resultData.usage || {},
               kind: resultData.ok ? "success" : (resultData.error || "unknown"),
             };
+            setTabStatus("done");
           }
         } else {
-          // Fallback: spawn child directly
+          // Fallback: spawn child directly. The child runs detached; on
+          // interrupt the drain timer aborts it after the grace window.
           const childConfig = { runDir, prompt, model: usedModel.model, thinking: usedModel.thinking, bin: config.piBin, cwd: repo };
-          const { result, exitCode } = await spawnIterationChild(childConfig, null);
+          childAbort = new AbortController();
+          const { result, exitCode } = await spawnIterationChild(childConfig, childAbort.signal);
+          const killed = childAbort.signal.aborted;
+          childAbort = null;
+          clearTimeout(drainTimer);
+          drainTimer = null;
           outcome = { ok: result.ok, result: result.result, text: result.text, usage: result.usage || {}, kind: result.ok ? "success" : (result.error || "unknown"), exitCode };
+          if (stopRequested && killed) {
+            // Grace window expired (or second signal): the child was killed.
+            // Roll back deliberately, record it, and stop.
+            setTabStatus("interrupted");
+            await rollback(repo).catch(() => {});
+            appendNotes(runDir, notesEntry({ iteration, model: usedModel.model, outcome: { state: "interrupted", summary: "iteration interrupted", changes: [], learnings: [] } }));
+            return finish("interrupted");
+          }
         }
       } catch (error) {
         log.event("iteration_spawn_error", { iteration, attempt, error: error.message }, `[tabs]   ! spawn failed: ${error.message}`);
@@ -341,6 +449,17 @@ export async function runTabs(options) {
       }
 
       if (outcome.ok) { failover.succeed(usedModel.model); break; }
+
+      if (stopRequested) {
+        // Interrupted mid-iteration: roll back deliberately, record it, and
+        // stop without touching failover bookkeeping.
+        setTabStatus("interrupted");
+        await rollback(repo).catch(() => {});
+        appendNotes(runDir, notesEntry({ iteration, model: usedModel.model, outcome: { state: "interrupted", summary: String(outcome.message || outcome.result?.summary || "iteration interrupted").slice(0, 500), changes: [], learnings: [] } }));
+        clearTimeout(drainTimer);
+        childAbort?.abort();
+        return finish("interrupted");
+      }
 
       const kind = outcome.kind || "unknown";
       const message = outcome.message || String(outcome.error || "").slice(0, 800);
@@ -372,7 +491,7 @@ export async function runTabs(options) {
         log.event("iteration_success", { iteration, model: usedModel.model, summary: result.summary },
           `[tabs]   ok: ${result.summary || "committed"} (commit ${state.commits})`);
         appendNotes(runDir, notesEntry({ iteration, model: usedModel.model, outcome: { state: "success", summary: result.summary, changes: result.keyChanges, learnings: result.keyLearnings } }));
-        if (result.shouldStop) return finish(stopWhen ? "stop_condition" : "done");
+        if (!stopRequested && result.shouldStop) return finish(stopWhen ? "stop_condition" : "done");
         persistState();
         continue;
       }
@@ -390,7 +509,7 @@ export async function runTabs(options) {
       log.event("iteration_noop", { iteration, model: usedModel.model, summary: result.summary },
         `[tabs]   no-op: no file changes (${consecutiveNoOps} in a row)`);
       appendNotes(runDir, notesEntry({ iteration, model: usedModel.model, outcome: { state: "no-op", summary: result.summary, changes: result.keyChanges, learnings: result.keyLearnings } }));
-      if (result.shouldStop) return finish(stopWhen ? "stop_condition" : "done");
+      if (!stopRequested && result.shouldStop) return finish(stopWhen ? "stop_condition" : "done");
       if (config.maxNoOps > 0 && consecutiveNoOps >= config.maxNoOps) return finish("stalled");
       persistState();
       continue;
